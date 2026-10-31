@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { Net, MAX_PLAYERS } from './net.js';
-import { TRACKS, buildTrack, N, ROAD_W, WALL } from './tracks.js';
+import { TRACKS, buildTrack, N } from './tracks.js';
 import * as sfx from './audio.js';
 
 const $ = id => document.getElementById(id);
@@ -122,9 +122,28 @@ function nearest(p, from = -1, win = 40) {
   return { idx: best, dist: Math.sqrt(bd) };
 }
 
+// Altezza della strada sotto un punto: interpola tra il campione più vicino e quello accanto
+function groundY(p, i) {
+  const s = samples[i], t = tangents[i];
+  const tl = Math.hypot(t.x, t.z) || 1;
+  const along = ((p.x - s.x) * t.x + (p.z - s.z) * t.z) / tl;
+  const j = along >= 0 ? (i + 1) % N : (i - 1 + N) % N;
+  const seg = Math.hypot(samples[j].x - s.x, samples[j].z - s.z) || 1;
+  return s.y + (samples[j].y - s.y) * Math.min(1, Math.abs(along) / seg);
+}
+// Altezza aggiuntiva del trampolino (0 fuori dalla rampa)
+function rampAt(idx, dist) {
+  if (track.jumpIdx < 0 || dist >= track.hw[idx]) return 0;
+  const k = (idx - (track.jumpIdx - 6) + N) % N;
+  return k <= 6 ? (k / 6) * 1.6 : 0;
+}
+// Inclinazione del kart in salita e in discesa
+const slopePitch = i => -Math.asin(clamp(tangents[i].y, -0.5, 0.5));
+
 // ---------- Kart ----------
 function makeKart(color, charId) {
   const g = new THREE.Group(), body = new THREE.Group();
+  g.rotation.order = 'YXZ';   // prima la direzione, poi l'inclinazione in salita/discesa
   const paint = new THREE.MeshLambertMaterial({ color }), dark = new THREE.MeshLambertMaterial({ color: '#222' });
   const add = (geo, mat, x, y, z, parent = body) => { const m = new THREE.Mesh(geo, mat); m.position.set(x, y, z); m.castShadow = true; parent.add(m); return m; };
   add(new THREE.BoxGeometry(1.6, 0.35, 2.6), paint, 0, 0.45, 0);              // telaio
@@ -236,7 +255,8 @@ let raceTime = 0, countdownT = 0;
 // Griglia di partenza: file da due, sfalsate
 function gridSlot(slot) {
   const i = N - 10 - Math.floor(slot / 2) * 7;
-  return { i, pos: samples[i].clone().addScaledVector(normals[i], slot % 2 ? -3 : 3), heading: Math.atan2(tangents[i].x, tangents[i].z) };
+  const lat = track.hw[i] * 0.43;
+  return { i, pos: samples[i].clone().addScaledVector(normals[i], slot % 2 ? -lat : lat), heading: Math.atan2(tangents[i].x, tangents[i].z) };
 }
 
 function spawnPlayer(slot = 0) {
@@ -248,7 +268,7 @@ function spawnPlayer(slot = 0) {
     id: mp ? net.myId : 'me', ...kartExtras(settings.char),
     mesh, pos, heading,
     speed: 0, idx: i, lap: 0, half: false, steerVis: 0, drift: 0, driftT: 0, driftVis: 0, boost: 0,
-    moveH: heading, y: 0, vy: 0, rampH: 0,
+    moveH: heading, y: pos.y, floor: pos.y, vy: 0, rampH: 0,
   };
   mesh.position.copy(player.pos);
 }
@@ -260,7 +280,7 @@ function updatePlayer(dt) {
   const p = player;
   const gas = input.gas || keys.ArrowUp || keys.KeyW;
   const brake = input.brake || keys.ArrowDown || keys.KeyS || keys.Space;
-  const air = p.y > 0.05;
+  const air = p.y > (p.floor ?? p.y) + 0.05;
   const steer = state === 'race' && !air && p.spin <= 0 ? readSteer() : 0;
   updateKartTimers(p, dt);
   // Partenza a razzo: conta da quando tieni premuto il gas durante il conto alla rovescia
@@ -271,7 +291,7 @@ function updatePlayer(dt) {
   input.steer = steer;
 
   const near = nearest(p.pos, p.idx);
-  const offroad = near.dist > ROAD_W + 1.2;
+  const offroad = near.dist > track.hw[near.idx] + 1.2;
 
   // Drift: gas + freno insieme mentre sterzi. Più lo tieni, più forte il mini-turbo
   const wantDrift = state === 'race' && gas && brake && p.speed > 10 && !offroad;
@@ -310,10 +330,11 @@ function updatePlayer(dt) {
 
   // Bordo pista: ti respinge e rallenta
   const n2 = nearest(p.pos, near.idx);
-  if (n2.dist > WALL) {
+  const wallD = track.wall[n2.idx];
+  if (n2.dist > wallD) {
     const c = samples[n2.idx];
     const dir = new THREE.Vector3(p.pos.x - c.x, 0, p.pos.z - c.z).normalize();
-    p.pos.set(c.x + dir.x * WALL, 0, c.z + dir.z * WALL);
+    p.pos.set(c.x + dir.x * wallD, 0, c.z + dir.z * wallD);
     p.moveH = p.heading;
     if (Math.abs(p.speed) > 8) buzz(40, sfx.bump);
     p.speed *= 0.6;
@@ -329,23 +350,21 @@ function updatePlayer(dt) {
     if (p.lap >= laps) finish();
   }
 
-  // Trampolino: sale lungo la rampa e in cima parte il salto
-  let rampH = 0;
-  if (track.jumpIdx >= 0 && n2.dist < ROAD_W) {
-    const k = (p.idx - (track.jumpIdx - 6) + N) % N;
-    if (k <= 6) rampH = (k / 6) * 1.6;
-  }
+  // Terreno e trampolino: in cima alla rampa parte il salto, in discesa il kart resta incollato alla strada
+  const rampH = rampAt(p.idx, n2.dist);
+  const floor = groundY(p.pos, n2.idx) + rampH;
   if (p.rampH > 1.2 && rampH === 0 && p.speed > 8 && !air) { p.vy = 3 + p.speed * 0.22; sfx.jump(); }
   p.rampH = rampH;
-  if (p.vy > 0 || p.y > rampH) {
+  if (p.vy > 0 || p.y > floor + 0.6) {
     p.vy -= 22 * dt;
     p.y += p.vy * dt;
-    if (p.y <= rampH) {
+    if (p.y <= floor) {
       if (p.vy < -6) buzz(40, sfx.land);
       if (p.trick) { p.trick = false; startBoost(p, 0.8); toast('🤸 Trick!'); }
-      p.y = rampH; p.vy = 0;
+      p.y = floor; p.vy = 0;
     }
-  } else p.y = rampH;
+  } else { p.y = floor; p.vy = 0; }
+  p.floor = floor;
 
   // Urti con gli altri kart: ognuno sposta solo sé stesso
   for (const r of [...remotes.values(), ...bots]) {
@@ -360,7 +379,7 @@ function updatePlayer(dt) {
   // Grafica
   p.mesh.position.copy(p.pos).setY(p.y);
   p.mesh.rotation.y = p.heading;
-  p.mesh.rotation.x = p.y > rampH + 0.05 ? clamp(-p.vy * 0.03, -0.3, 0.3) : rampH > 0 ? -0.2 : 0;
+  p.mesh.rotation.x = p.y > floor + 0.05 ? clamp(-p.vy * 0.03, -0.3, 0.3) : rampH > 0 ? -0.2 : slopePitch(p.idx);
   p.steerVis += (steer - p.steerVis) * Math.min(1, dt * 10);
   if (p.trick) p.trickT += dt;
   p.mesh.body.rotation.z = p.trick ? Math.min(1, p.trickT / 0.45) * Math.PI * 2 : p.steerVis * 0.08 * (p.speed / MAX_SPEED);
@@ -464,7 +483,7 @@ function makeBot(id, name, color, slot, level, charId = CHARS[slot % CHARS.lengt
   return {
     ...kartExtras(charId),
     id, name, mesh, L, pos: g.pos, heading: g.heading, moveH: g.heading, speed: 0, idx: g.i,
-    lap: 0, half: false, y: 0, vy: 0, rampH: 0, boost: 0, done: false, has: true,
+    lap: 0, half: false, y: g.pos.y, floor: g.pos.y, vy: 0, rampH: 0, boost: 0, done: false, has: true,
     lane: slot % 2 ? -3 : 3, laneT: 1 + Math.random() * 2, prevCurv: 0, netT: Math.random() / 15,
     skill: L.speed * (0.96 + Math.random() * 0.06),
   };
@@ -489,12 +508,12 @@ function updateBot(b, dt) {
 
   // Ogni tanto cambia traiettoria; se ha un kart davanti prova a superarlo di lato
   b.laneT -= dt;
-  if (b.laneT <= 0) { b.lane = clamp((Math.random() * 2 - 1) * 3.5 * b.L.err, -5, 5); b.laneT = 2 + Math.random() * 3; }
+  if (b.laneT <= 0) { b.lane = clamp((Math.random() * 2 - 1) * 3.5 * b.L.err * track.hw[b.idx] / 7, -(track.hw[b.idx] - 2), track.hw[b.idx] - 2); b.laneT = 2 + Math.random() * 3; }
   for (const o of allKarts()) {
     if (o.id === b.id) continue;
     const rx = o.pos.x - b.pos.x, rz = o.pos.z - b.pos.z;
     const ahead = rx * fx + rz * fz, side = rx * fz - rz * fx;
-    if (ahead > 0 && ahead < 8 && Math.abs(side) < 2.4) { b.lane = clamp(b.lane + (side > 0 ? 3 : -3), -5, 5); b.laneT = 1.5; }
+    if (ahead > 0 && ahead < 8 && Math.abs(side) < 2.4) { b.lane = clamp(b.lane + (side > 0 ? 3 : -3), -(track.hw[b.idx] - 2), track.hw[b.idx] - 2); b.laneT = 1.5; }
   }
 
   // Punta a un punto più avanti sulla pista, spostato sulla sua corsia
@@ -513,7 +532,7 @@ function updateBot(b, dt) {
     const gap = progress(player) - progress(b);
     if (gap > 60) target *= 1.07; else if (gap < -120) target *= 0.93;
   }
-  if (near.dist > ROAD_W + 1.2) target = Math.min(target, OFFROAD_SPEED);
+  if (near.dist > track.hw[near.idx] + 1.2) target = Math.min(target, OFFROAD_SPEED);
   if (b.prevCurv > 0.2 && curv < 0.05 && !b.done && Math.random() < b.L.boost) b.boost = 0.8;
   b.prevCurv = curv;
   if (b.boost > 0) { b.boost -= dt; target = topSpeed(b) * 1.25; }
@@ -521,13 +540,13 @@ function updateBot(b, dt) {
   if (b.item && (b.itemT -= dt) <= 0) { useItem(b, false); b.itemT = 0.6; }
   b.speed += b.speed < target ? ACCEL * dt : -Math.min(b.speed - target, BRAKE * 0.6 * dt);
 
-  if (b.y < 0.05) b.moveH += angleDiff(b.heading, b.moveH) * Math.min(1, 12 * track.def.grip * dt);
+  if (b.y < (b.floor ?? b.y) + 0.05) b.moveH += angleDiff(b.heading, b.moveH) * Math.min(1, 12 * track.def.grip * dt);
   b.pos.x += Math.sin(b.moveH) * b.speed * dt;
   b.pos.z += Math.cos(b.moveH) * b.speed * dt;
 
   const n2 = nearest(b.pos, near.idx);
-  if (n2.dist > WALL) {
-    const c = samples[n2.idx], k = WALL / n2.dist;
+  if (n2.dist > track.wall[n2.idx]) {
+    const c = samples[n2.idx], k = track.wall[n2.idx] / n2.dist;
     b.pos.set(c.x + (b.pos.x - c.x) * k, 0, c.z + (b.pos.z - c.z) * k);
     b.speed *= 0.6; b.moveH = b.heading;
   }
@@ -541,11 +560,11 @@ function updateBot(b, dt) {
   }
 
   // Trampolino
-  let rampH = 0;
-  if (track.jumpIdx >= 0 && n2.dist < ROAD_W) { const k = (b.idx - (track.jumpIdx - 6) + N) % N; if (k <= 6) rampH = (k / 6) * 1.6; }
+  const rampH = rampAt(b.idx, n2.dist), floor = groundY(b.pos, n2.idx) + rampH;
   if (b.rampH > 1.2 && rampH === 0 && b.speed > 8) { b.vy = 3 + b.speed * 0.22; b.trick = Math.random() < b.L.boost + 0.2; }
   b.rampH = rampH;
-  if (b.vy > 0 || b.y > rampH) { b.vy -= 22 * dt; b.y += b.vy * dt; if (b.y <= rampH) { b.y = rampH; b.vy = 0; if (b.trick) { b.trick = false; startBoost(b, 0.8); } } } else b.y = rampH;
+  if (b.vy > 0 || b.y > floor + 0.6) { b.vy -= 22 * dt; b.y += b.vy * dt; if (b.y <= floor) { b.y = floor; b.vy = 0; if (b.trick) { b.trick = false; startBoost(b, 0.8); } } } else { b.y = floor; b.vy = 0; }
+  b.floor = floor;
   kartPickups(b, false, dt);
   checkHazards(b, false);
 
@@ -559,6 +578,7 @@ function updateBot(b, dt) {
   const m = b.mesh;
   m.position.copy(b.pos).setY(b.y);
   m.rotation.y = b.heading;
+  m.rotation.x = b.y > floor + 0.05 ? clamp(-b.vy * 0.03, -0.3, 0.3) : slopePitch(b.idx);
   for (const w of m.wheels) w.rotation.x += b.speed * dt / 0.42;
   m.body.rotation.y = b.spinAng;
   for (const s of m.sparks) { s.visible = b.boost > 0; s.material.color.set('#ff8a00'); s.scale.setScalar(0.6 + Math.random() * 1.4); }
@@ -596,7 +616,8 @@ const ITEM_ODDS = [
 ];
 let pickGroup = null, gems = [], boxes = [], pads = [], traps = [], rockets = [], fxSeq = 0;
 
-function lanePos(i, lane) { return samples[i].clone().addScaledVector(normals[i], lane); }
+// Corsie in proporzione alla larghezza della strada in quel punto (le piste classiche sono larghe 7 per lato)
+function lanePos(i, lane) { return samples[i].clone().addScaledVector(normals[i], lane * track.hw[i] / 7); }
 
 function setupPickups() {
   if (pickGroup) scene.remove(pickGroup);
@@ -607,7 +628,7 @@ function setupPickups() {
     const lane = [-4, 3, 0, -2, 4, 1, -3][k];
     for (let j = 0; j < 4; j++) {
       const i = (Math.round(f * N) + j * 4) % N;
-      const m = new THREE.Mesh(gemG, gemM); m.position.copy(lanePos(i, lane)).setY(0.9);
+      const m = new THREE.Mesh(gemG, gemM); m.position.copy(lanePos(i, lane)); m.position.y += 0.9;
       pickGroup.add(m);
       gems.push({ mesh: m, pos: m.position, on: true, t: 0 });
     }
@@ -618,7 +639,7 @@ function setupPickups() {
   for (const f of [0.27, 0.57, 0.84]) {
     const i = Math.round(f * N);
     for (const lane of [-5, -2.5, 0, 2.5, 5]) {
-      const m = new THREE.Mesh(boxG, boxM); m.position.copy(lanePos(i, lane)).setY(1.1);
+      const m = new THREE.Mesh(boxG, boxM); m.position.copy(lanePos(i, lane)); m.position.y += 1.1;
       pickGroup.add(m);
       boxes.push({ mesh: m, pos: m.position, on: true, t: 0 });
     }
@@ -633,7 +654,7 @@ function setupPickups() {
   [0.15, 0.46, 0.72].forEach((f, k) => {
     const i = Math.round(f * N), lane = [-3, 2.5, 0][k];
     const m = new THREE.Mesh(new THREE.PlaneGeometry(3.4, 5).rotateX(-Math.PI / 2), padM);
-    m.position.copy(lanePos(i, lane)).setY(0.06);
+    m.position.copy(lanePos(i, lane)); m.position.y += 0.06;
     m.rotation.y = Math.atan2(tangents[i].x, tangents[i].z);
     pickGroup.add(m);
     pads.push({ pos: m.position });
@@ -670,7 +691,7 @@ function rollItem(k) {
 
 // Raccolta di gemme, cristalli e pannelli per un kart guidato su questo telefono
 function kartPickups(k, isPlayer, dt) {
-  const near = (o, r) => (o.pos.x - k.pos.x) ** 2 + (o.pos.z - k.pos.z) ** 2 < r * r && k.y < 2;
+  const near = (o, r) => (o.pos.x - k.pos.x) ** 2 + (o.pos.z - k.pos.z) ** 2 < r * r && k.y - (k.floor ?? 0) < 2;
   for (const g of gems) if (g.on && near(g, 1.8)) {
     g.on = false; g.mesh.visible = false; g.t = 8;
     if (k.gems < 10) k.gems++;
@@ -716,7 +737,8 @@ function addTrap(m) {
   const mesh = new THREE.Mesh(new THREE.CircleGeometry(1.6, 16).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: '#1a1a22', transparent: true, opacity: 0.85 }));
   const shine = new THREE.Mesh(new THREE.CircleGeometry(0.5, 10).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color: '#6b5cff', transparent: true, opacity: 0.6 }));
   shine.position.set(0.4, 0.01, 0.3); mesh.add(shine);
-  mesh.position.set(+m.x, 0.07, +m.z);
+  const tp = new THREE.Vector3(+m.x, 0, +m.z);
+  mesh.position.set(tp.x, groundY(tp, nearest(tp).idx) + 0.07, tp.z);
   pickGroup.add(mesh);
   traps.push({ id: m.tid, mesh, pos: mesh.position, owner: m.owner, age: 0 });
 }
@@ -756,7 +778,7 @@ function hitKart(k, isPlayer) {
 function checkHazards(k, isPlayer) {
   for (const t of [...traps]) {
     if (t.owner === k.id && t.age < 1) continue;
-    if ((t.pos.x - k.pos.x) ** 2 + (t.pos.z - k.pos.z) ** 2 < 3.2 && k.y < 1) {
+    if ((t.pos.x - k.pos.x) ** 2 + (t.pos.z - k.pos.z) ** 2 < 3.2 && k.y - (k.floor ?? 0) < 1) {
       removeFx(traps, t.id); sendFx({ k: 'tgone', tid: t.id }); hitKart(k, isPlayer);
     }
   }
@@ -774,7 +796,7 @@ function updatePickups(dt) {
   if (!pickGroup) return;
   const now = performance.now() / 1000;
   for (const g of gems) { g.mesh.rotation.y = now * 2; if (!g.on && (g.t -= dt) <= 0) { g.on = true; g.mesh.visible = true; } }
-  for (const b of boxes) { b.mesh.rotation.y = now * 1.5; b.mesh.position.y = 1.1 + Math.sin(now * 3 + b.pos.x) * 0.15; if (!b.on && (b.t -= dt) <= 0) { b.on = true; b.mesh.visible = true; } }
+  for (const b of boxes) { b.mesh.rotation.y = now * 1.5; b.baseY ??= b.mesh.position.y; b.mesh.position.y = b.baseY + Math.sin(now * 3 + b.pos.x) * 0.15; if (!b.on && (b.t -= dt) <= 0) { b.on = true; b.mesh.visible = true; } }
   for (const t of traps) t.age += dt;
   for (const r of [...rockets]) {
     r.age += dt;
@@ -787,6 +809,7 @@ function updatePickups(dt) {
     r.h += clamp(angleDiff(want, r.h), -3.2 * dt, 3.2 * dt);
     r.pos.x += Math.sin(r.h) * 44 * dt; r.pos.z += Math.cos(r.h) * 44 * dt;
     r.mesh.rotation.y = r.h;
+    r.pos.y = groundY(r.pos, r.idx = nearest(r.pos, r.idx).idx) + 1;
     if (r.age > 6) removeFx(rockets, r.id);
   }
 }
@@ -819,8 +842,8 @@ function updateChaseCam(dt, snap = false) {
   const p = player;
   fwd.set(Math.sin(p.heading), 0, Math.cos(p.heading));
   const v = VIEWS[settings.view] || VIEWS[0];
-  const target = p.pos.clone().addScaledVector(fwd, v.back).setY(v.up + p.y * 0.7);
-  const look = p.pos.clone().addScaledVector(fwd, v.ahead).setY(v.lookY + p.y * 0.5);
+  const target = p.pos.clone().addScaledVector(fwd, v.back).setY(p.y + v.up);
+  const look = p.pos.clone().addScaledVector(fwd, v.ahead).setY(p.y + v.lookY);
   p.mesh.body.visible = !v.cockpit;   // in prima persona nascondo pilota e telaio
   const k = snap || v.cockpit ? 1 : 1 - Math.exp(-dt * 8);
   camPos.lerp(target, k); camLook.lerp(look, k);
@@ -1236,7 +1259,7 @@ function loop() {
     // Giro panoramico sulla pista
     menuT += dt * 0.012;
     const a = curve.getPointAt(menuT % 1), b = curve.getPointAt((menuT + 0.03) % 1);
-    camera.position.lerp(a.clone().setY(18).add(new THREE.Vector3(0, 0, 0)), 0.05);
+    camera.position.lerp(a.clone().setY(a.y + 18), 0.05);
     camera.lookAt(b);
     camera.fov = 70; camera.updateProjectionMatrix();
   } else if (player) {
@@ -1264,6 +1287,7 @@ function loop() {
     updateChaseCam(dt);
     updateHUD();
   }
+  track?.update?.(performance.now() / 1000);
   updateAudio();
   renderer.render(scene, camera);
   requestAnimationFrame(loop);
