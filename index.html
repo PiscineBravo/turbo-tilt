@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#1b1446">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Turbo Tilt</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon.svg">
+<link rel="stylesheet" href="style.css">
+<script type="importmap">{"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js"}}</script>
+</head>
+<body>
+<div id="game"></div>
+
+<!-- Zone touch invisibili -->
+<div id="zone-brake" class="zone"></div>
+<div id="zone-gas" class="zone"></div>
+
+<!-- HUD -->
+<div id="hud" class="hidden">
+  <div class="hud-l"><span id="hud-pos"></span><span id="hud-lap">GIRO 1/3</span><span id="hud-time">0:00.00</span></div>
+  <button id="btn-pause" aria-label="Pausa">❚❚</button>
+  <button id="btn-cam" aria-label="Cambia visuale">🎥</button>
+  <button id="btn-sound" aria-label="Audio">🔊</button>
+  <div class="hud-r"><span id="hud-speed">0</span><small>km/h</small></div>
+  <span id="hud-gems" class="hud-gems">💎 0</span>
+  <button id="btn-item" class="empty" aria-label="Usa oggetto"></button>
+  <div id="toast" class="hidden"></div>
+  <div id="steer-bar"><div id="steer-dot"></div></div>
+</div>
+<div id="countdown" class="hidden"></div>
+
+<!-- Menu di gioco: titolo → menu principale → pilota → pista (oppure opzioni) -->
+<div id="menu" class="screen menu">
+  <section id="scr-title" class="mscr">
+    <h1 class="logo">TURBO<span>TILT</span></h1>
+    <p class="tagline">Kart arcade · inclina per sterzare</p>
+    <button id="btn-press" class="press">Tocca per iniziare</button>
+  </section>
+
+  <section id="scr-main" class="mscr hidden">
+    <h1 class="logo small">TURBO<span>TILT</span></h1>
+    <div class="tiles">
+      <button class="tile t-solo" data-mode="solo"><b>🏁</b><span>Gara singola</span><small>Una pista contro la CPU</small></button>
+      <button class="tile t-cup" data-mode="cup"><b>🏆</b><span>Coppa</span><small>Tutte le piste, vince chi fa più punti</small></button>
+      <button class="tile t-multi" data-mode="multi"><b>👥</b><span>Multiplayer</span><small>Online o in Wi‑Fi con gli amici</small></button>
+      <button class="tile t-opt" data-mode="options"><b>⚙️</b><span>Opzioni</span><small>Nome, sterzo, suoni</small></button>
+    </div>
+  </section>
+
+  <section id="scr-chars" class="mscr hidden">
+    <header class="mhead"><button class="back" data-back="scr-main">‹</button><h2>Scegli il pilota</h2></header>
+    <div class="chars-layout">
+      <div id="chars" class="char-grid"></div>
+      <div class="char-stage"></div>
+      <div class="char-info">
+        <h3 id="ci-name"></h3>
+        <p id="ci-class" class="ci-class"></p>
+        <div class="stat"><span>Velocità</span><i><b id="st-top"></b></i></div>
+        <div class="stat"><span>Accelerazione</span><i><b id="st-acc"></b></i></div>
+        <div class="stat"><span>Peso</span><i><b id="st-weight"></b></i></div>
+        <div class="row ci-colors">Kart <div id="colors"></div></div>
+        <button id="btn-chars-ok" class="go">Avanti ▶</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="scr-tracks" class="mscr hidden">
+    <header class="mhead"><button class="back" data-back="scr-chars">‹</button><h2 id="tracks-title">Scegli la pista</h2></header>
+    <div id="track-pick" class="track-cards"></div>
+    <div class="race-bar">
+      <label>CPU <select id="bots"><option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option><option value="9">9</option></select></label>
+      <label>Livello <select id="level"><option value="facile">Facile</option><option value="medio">Medio</option><option value="difficile">Difficile</option></select></label>
+      <label>Giri <select id="laps"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option></select></label>
+      <button id="btn-go" class="go">Via! 🏁</button>
+    </div>
+  </section>
+
+  <section id="scr-options" class="mscr hidden">
+    <header class="mhead"><button class="back" data-back="scr-main">‹</button><h2>Opzioni</h2></header>
+    <div class="opt-list">
+      <label>Nome pilota <input id="name" maxlength="12" autocomplete="off" spellcheck="false"></label>
+      <label>Sensibilità sterzo <input type="range" id="sens" min="1" max="10" step="1"></label>
+      <label class="check"><input type="checkbox" id="invert"> Inverti sterzo</label>
+      <label class="check"><input type="checkbox" id="sound"> Suoni e musica</label>
+    </div>
+    <div class="howto">
+      <p>📱 Inclina il telefono come un volante</p>
+      <p>👉 Destra: accelera · 👈 Sinistra: frena</p>
+      <p>🔥 Entrambi in curva: derapata e mini‑turbo</p>
+      <p>🚀 Gas nell'ultimo secondo del via: partenza a razzo</p>
+      <p>🤸 Tocca in aria: trick · 🔮 Pulsante in basso: oggetto</p>
+    </div>
+  </section>
+</div>
+
+<!-- Lobby multiplayer -->
+<div id="lobby" class="screen hidden">
+  <h2>Multiplayer</h2>
+  <div id="lobby-choose" class="buttons">
+    <button id="btn-host" class="big">➕ Crea stanza</button>
+    <div class="join"><input id="code" maxlength="4" placeholder="CODICE" autocomplete="off" autocapitalize="characters" spellcheck="false"><button id="btn-join" class="big">Entra</button></div>
+  </div>
+  <div id="lobby-room" class="hidden">
+    <p class="room">Codice stanza <b id="room-code"></b> <span id="player-count"></span></p>
+    <div id="lobby-host-cfg" class="panel">
+      <div id="lobby-pick" class="track-pick"></div>
+      <label>CPU <select id="lobby-bots"><option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option><option value="9">9</option></select></label>
+      <label>Livello <select id="lobby-level"><option value="facile">Facile</option><option value="medio">Medio</option><option value="difficile">Difficile</option></select></label>
+      <label>Giri <select id="lobby-laps"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option></select></label>
+    </div>
+    <p id="lobby-cfg" class="room"></p>
+    <ul id="players"></ul>
+  </div>
+  <p id="lobby-msg" class="hint"></p>
+  <div class="buttons">
+    <button id="btn-start" class="big hidden">🏁 Avvia gara</button>
+    <button id="btn-leave" class="big ghost">Indietro</button>
+  </div>
+</div>
+
+<!-- Pausa / fine gara -->
+<div id="overlay" class="screen hidden">
+  <h2 id="ov-title">Pausa</h2>
+  <p id="ov-text"></p>
+  <div class="buttons">
+    <button id="btn-resume" class="big">▶ Continua</button>
+    <button id="btn-retry" class="big">↻ Riprova</button>
+    <button id="btn-lobby" class="big hidden">↩ Torna alla stanza</button>
+    <button id="btn-next" class="big hidden">▶</button>
+    <button id="btn-menu" class="big ghost">Menu</button>
+  </div>
+</div>
+
+<div id="rotate"><div>📱↻</div><p>Ruota il telefono in orizzontale</p></div>
+
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script type="module" src="game.js"></script>
+<script>
+if ('serviceWorker' in navigator) addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+</script>
+</body>
+</html>
