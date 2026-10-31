@@ -1,6 +1,6 @@
-const CACHE = 'turbotilt-v13';
+const CACHE = 'turbotilt-v14';
 const SHELL = ['./', 'index.html', 'style.css', 'game.js', 'net.js', 'tracks.js', 'audio.js', 'manifest.webmanifest', 'icon.svg',
-  'https://unpkg.com/three@0.160.0/build/three.module.js', 'https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js'];
+  'https://unpkg.com/three@0.160.0/build/three.module.js', 'https://unpkg.com/three@0.160.0/examples/jsm/utils/BufferGeometryUtils.js', 'https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js'];
 
 self.addEventListener('install', e => e.waitUntil(caches.open(CACHE).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())));
 self.addEventListener('activate', e => e.waitUntil(

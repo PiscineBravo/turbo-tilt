@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { Net, MAX_PLAYERS } from './net.js';
 import { TRACKS, buildTrack, N } from './tracks.js';
 import * as sfx from './audio.js';
@@ -158,108 +159,253 @@ const statsOf = (charId, kartId) => { const c = charOf(charId), k = kartOf(kartI
 const _mats = new Map();
 const mat = (c, e) => { const key = c + (e || ''); if (!_mats.has(key)) _mats.set(key, new THREE.MeshLambertMaterial({ color: c, emissive: e || '#000000' })); return _mats.get(key); };
 
+// Unisce i pezzi di un gruppo che condividono lo stesso materiale: tanti dettagli, poche operazioni di disegno
+function bakeGroup(grp) {
+  grp.updateMatrixWorld(true);
+  const inv = grp.matrixWorld.clone().invert(), byMat = new Map(), drop = [];
+  grp.traverse(o => {
+    if (!o.isMesh || o.userData.keep) return;
+    const geo = o.geometry.index ? o.geometry.toNonIndexed() : o.geometry.clone();
+    for (const k of Object.keys(geo.attributes)) if (!['position', 'normal', 'uv'].includes(k)) geo.deleteAttribute(k);
+    if (!geo.attributes.uv) geo.setAttribute('uv', new THREE.Float32BufferAttribute(new Float32Array(geo.attributes.position.count * 2), 2));
+    geo.applyMatrix4(inv.clone().multiply(o.matrixWorld));
+    if (!byMat.has(o.material)) byMat.set(o.material, []);
+    byMat.get(o.material).push(geo);
+    drop.push(o);
+  });
+  for (const o of drop) o.parent.remove(o);
+  for (const [m, geos] of byMat) {
+    const merged = mergeGeometries(geos);
+    if (!merged) continue;
+    const mesh = new THREE.Mesh(merged, m); mesh.castShadow = true;
+    grp.add(mesh);
+  }
+}
+
 function makeKart(color, charId, kartId) {
   const g = new THREE.Group(), body = new THREE.Group();
   g.rotation.order = 'YXZ';   // prima la direzione, poi l'inclinazione in salita/discesa
-  const paint = new THREE.MeshLambertMaterial({ color }), dark = mat('#222226'), metal = mat('#9aa0a8'), light = mat('#fff6c8', '#a08a30');
+  const paint = new THREE.MeshPhongMaterial({ color, shininess: 90, specular: '#666666' });
+  const accent = new THREE.MeshPhongMaterial({ color: new THREE.Color(color).offsetHSL(0, 0, -0.18), shininess: 60 });
+  const dark = mat('#222226'), rubber = mat('#151517'), metal = new THREE.MeshPhongMaterial({ color: '#b8bec8', shininess: 120, specular: '#ffffff' });
+  const white = mat('#f4f4f4'), head = mat('#fff6c8', '#ffe27a'), tail = mat('#ff3344', '#c4001a'), glass = new THREE.MeshPhongMaterial({ color: '#9fd8ff', transparent: true, opacity: 0.45, shininess: 120 });
+  glass.userData = {};
   const add = (geo, m, x, y, z, parent = body) => { const o = new THREE.Mesh(geo, m); o.position.set(x, y, z); o.castShadow = true; parent.add(o); return o; };
   const box = (w, h, d, m, x, y, z, p) => add(new THREE.BoxGeometry(w, h, d), m, x, y, z, p);
+  const cyl = (r1, r2, h, m, x, y, z, p, seg = 10) => add(new THREE.CylinderGeometry(r1, r2, h, seg), m, x, y, z, p);
+  // Tubo da un punto a un altro (sospensioni, roll bar, paraurti)
+  const tube = (a, b2, r, m, p = body) => {
+    const A = new THREE.Vector3(...a), B = new THREE.Vector3(...b2), len = A.distanceTo(B);
+    const o = add(new THREE.CylinderGeometry(r, r, len, 6), m, 0, 0, 0, p);
+    o.position.copy(A).add(B).multiplyScalar(0.5);
+    o.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), B.clone().sub(A).normalize());
+    return o;
+  };
+  // Profilo laterale (z avanti, y su) estruso in larghezza e smussato: carrozzerie morbide
+  const side = (pts, width, m, x = 0, bevel = 0.07, p = body) => {
+    const sh = new THREE.Shape(pts.map(([z, y]) => new THREE.Vector2(z, y)));
+    const depth = Math.max(0.01, width - bevel * 2);
+    const geo = new THREE.ExtrudeGeometry(sh, { depth, bevelEnabled: true, bevelThickness: bevel, bevelSize: bevel, bevelSegments: 2, curveSegments: 8 });
+    geo.translate(0, 0, -depth / 2); geo.rotateY(-Math.PI / 2);
+    return add(geo, m, x, 0, 0, p);
+  };
+  // Solido di rotazione lungo l'asse z (fusoliere, gondole)
+  const lathe = (pts, m, x, y, z, seg = 18, p = body) => add(new THREE.LatheGeometry(pts.map(([r, h]) => new THREE.Vector2(r, h)), seg).rotateX(Math.PI / 2), m, x, y, z, p);
+  // Profilo alare per alettoni
+  const wing = (span, chord, m, x, y, z, tilt = 0.12) => {
+    const o = side([[-chord / 2, 0], [chord * 0.1, 0.02], [chord / 2, 0.06], [chord * 0.1, 0.12], [-chord / 2, 0.08]], span, m, x, 0.02);
+    o.position.set(x, y, z); o.rotation.x = tilt; return o;
+  };
   const kart = kartOf(kartId);
 
-  // Ruota: copertone + cerchio colorato; front = sterzanti
+  // Ruota: copertone smussato, cerchio a razze, mozzo e disco del freno
   g.wheels = [];
   const wheel = (x, z, r, w, rim = metal, knobby = false) => {
-    const wg = new THREE.Group();
-    add(new THREE.CylinderGeometry(r, r, w, 14).rotateZ(Math.PI / 2), dark, 0, 0, 0, wg);
-    add(new THREE.CylinderGeometry(r * 0.55, r * 0.55, w + 0.04, 10).rotateZ(Math.PI / 2), rim, 0, 0, 0, wg);
-    if (knobby) for (let k = 0; k < 8; k++) { const t = add(new THREE.BoxGeometry(w + 0.06, 0.12, 0.18), dark, 0, Math.cos(k * 0.785) * r, Math.sin(k * 0.785) * r, wg); t.rotation.x = k * 0.785; }
+    const wg = new THREE.Group(); wg.rotation.order = 'YXZ';
+    const t = Math.min(w / 2, r * 0.32);
+    const tire = add(new THREE.TorusGeometry(r - t, t, 10, 22).rotateY(Math.PI / 2), rubber, 0, 0, 0, wg); tire.scale.x = w / (2 * t);
+    cyl(r - t * 1.2, r - t * 1.2, w * 0.92, rubber, 0, 0, 0, wg, 16).rotation.z = Math.PI / 2;
+    const side = Math.sign(x) || 1;
+    cyl(r * 0.58, r * 0.58, 0.06, rim, side * w * 0.47, 0, 0, wg, 16).rotation.z = Math.PI / 2;
+    for (let k = 0; k < 5; k++) { const sp = box(0.05, r * 0.95, 0.09, rim, side * w * 0.5, 0, 0, wg); sp.rotation.x = k * Math.PI / 5; }
+    add(new THREE.SphereGeometry(r * 0.16, 8, 6), metal, side * w * 0.52, 0, 0, wg);
+    cyl(r * 0.45, r * 0.45, 0.05, mat('#5a5f66'), -side * w * 0.2, 0, 0, wg, 12).rotation.z = Math.PI / 2;
+    const tread = knobby ? 12 : 16;
+    for (let k = 0; k < tread; k++) {
+      const a = k * Math.PI * 2 / tread;
+      const tb = box(w * (knobby ? 1.08 : 0.86), knobby ? 0.14 : 0.04, knobby ? 0.22 : 0.09, rubber, 0, Math.cos(a) * r, Math.sin(a) * r, wg);
+      tb.rotation.x = -a;
+    }
+    bakeGroup(wg);
     wg.position.set(x, r, z); g.add(wg); g.wheels.push(wg);
+  };
+  const lights = (zF, yF, xF, zR, yR, xR, round = false) => {
+    for (const sx of [1, -1]) {
+      if (zF != null) { (round ? add(new THREE.SphereGeometry(0.13, 10, 8), head, sx * xF, yF, zF) : box(0.26, 0.12, 0.06, head, sx * xF, yF, zF)); }
+      if (zR != null) box(0.22, 0.1, 0.06, tail, sx * xR, yR, zR);
+    }
   };
   let seatY = 0.85, seatZ = -0.5;
 
   switch (kart.id) {
-    case 'freccia': { // monoposto basso e affilato con alettone grande
-      box(1.3, 0.3, 3.2, paint, 0, 0.42, 0.1);
-      const nose = add(new THREE.ConeGeometry(0.62, 1.4, 4).rotateX(Math.PI / 2).rotateZ(Math.PI / 4), paint, 0, 0.42, 2.3); nose.scale.set(1.1, 0.5, 1);
-      box(2.1, 0.08, 0.45, dark, 0, 0.28, 2.6);                                  // alettone anteriore
-      for (const sx of [1, -1]) { box(0.35, 0.35, 1.4, paint, sx * 0.85, 0.45, -0.2); box(0.08, 0.7, 0.2, dark, sx * 0.5, 1.0, -1.45); }
-      box(2.0, 0.1, 0.55, paint, 0, 1.38, -1.5);                                  // alettone posteriore
-      box(2.0, 0.06, 0.3, dark, 0, 1.47, -1.65);
-      wheel(0.95, 1.5, 0.36, 0.32); wheel(-0.95, 1.5, 0.36, 0.32); wheel(1.0, -1.05, 0.46, 0.55); wheel(-1.0, -1.05, 0.46, 0.55);
-      seatY = 0.62; seatZ = -0.45;
+    case 'freccia': { // monoposto: scocca lunga, pance, ali e sospensioni a vista
+      side([[-1.6, 0.25], [2.4, 0.25], [2.95, 0.33], [2.7, 0.48], [0.9, 0.72], [0.25, 0.92], [-0.7, 0.98], [-1.4, 0.85], [-1.6, 0.6]], 0.92, paint);
+      for (const sx of [1, -1]) side([[-1.1, 0.22], [0.55, 0.22], [0.8, 0.45], [0.5, 0.68], [-1.25, 0.66]], 0.42, accent, sx * 0.66);
+      side([[-1.5, 0.95], [0.0, 0.95], [-0.3, 1.35], [-1.5, 1.3]], 0.08, paint);         // pinna motore
+      wing(2.3, 0.55, paint, 0, 0.25, 2.75, 0.05);
+      for (const sx of [1, -1]) { box(0.06, 0.32, 0.65, accent, sx * 1.15, 0.36, 2.75); box(0.06, 0.65, 0.75, accent, sx * 1.02, 1.2, -1.6); }
+      wing(2.0, 0.6, paint, 0, 1.38, -1.6, 0.22);
+      wing(2.0, 0.35, accent, 0, 1.55, -1.82, 0.4);
+      box(0.12, 0.55, 0.3, dark, 0, 1.05, -1.55);
+      for (const [z, wx] of [[1.6, 0.95], [-1.1, 1.0]]) for (const sx of [1, -1]) {
+        tube([sx * 0.4, 0.55, z + 0.2], [sx * wx, 0.42, z], 0.035, metal);
+        tube([sx * 0.4, 0.35, z - 0.25], [sx * wx, 0.42, z], 0.035, metal);
+      }
+      cyl(0.09, 0.11, 0.4, metal, 0, 0.65, -1.75).rotation.x = Math.PI / 2;
+      box(1.2, 0.03, 0.7, white, 0, 0.66, 1.6);                                       // striscia sul muso
+      lights(null, 0, 0, -1.62, 0.6, 0.18);
+      wheel(0.95, 1.6, 0.36, 0.34); wheel(-0.95, 1.6, 0.36, 0.34); wheel(1.0, -1.1, 0.46, 0.56); wheel(-1.0, -1.1, 0.46, 0.56);
+      seatY = 0.6; seatZ = -0.4;
       break;
     }
-    case 'bolla': { // guscio tondo e paffuto con due fari a occhioni
-      const shell = add(new THREE.SphereGeometry(1.15, 18, 14), paint, 0, 0.75, 0.15); shell.scale.set(1, 0.55, 1.3);
-      box(1.3, 0.3, 0.9, dark, 0, 0.95, -0.35);                                  // abitacolo scavato
+    case 'bolla': { // utilitaria tonda con parabrezza, passaruota e ruota di scorta
+      const shell = add(new THREE.SphereGeometry(1.15, 24, 16, 0, Math.PI * 2, 0, Math.PI * 0.62), paint, 0, 0.42, 0.1); shell.scale.set(1, 0.85, 1.35);
+      add(new THREE.TorusGeometry(1.12, 0.12, 8, 28).rotateX(Math.PI / 2), accent, 0, 0.45, 0.1).scale.set(1, 1.35, 1);
+      box(1.25, 0.5, 0.95, dark, 0, 1.05, -0.35);                                     // abitacolo
+      const ws = add(new THREE.SphereGeometry(0.9, 16, 8, -0.9, 1.8, 0.2, 0.9), glass, 0, 0.75, 0.15); ws.scale.set(0.8, 0.9, 0.9);
       for (const sx of [1, -1]) {
-        add(new THREE.SphereGeometry(0.22, 10, 8), light, sx * 0.45, 0.9, 1.45);
-        add(new THREE.SphereGeometry(0.1, 8, 6), mat('#111'), sx * 0.45, 0.92, 1.62);
+        add(new THREE.TorusGeometry(0.2, 0.05, 8, 16), metal, sx * 0.48, 0.85, 1.52);
+        add(new THREE.SphereGeometry(0.17, 12, 10), head, sx * 0.48, 0.85, 1.5);
+        for (const z of [0.85, -0.85]) add(new THREE.TorusGeometry(0.48, 0.09, 6, 16, Math.PI).rotateY(Math.PI / 2), accent, sx * 0.98, 0.42, z);
+        box(0.18, 0.1, 0.05, tail, sx * 0.55, 0.75, -1.38);
       }
-      add(new THREE.TorusGeometry(0.35, 0.06, 6, 14).rotateX(Math.PI / 2), metal, 0, 0.45, -1.45); // paraurti a ciambella
-      wheel(0.95, 0.85, 0.36, 0.42, paint); wheel(-0.95, 0.85, 0.36, 0.42, paint); wheel(0.95, -0.85, 0.38, 0.46, paint); wheel(-0.95, -0.85, 0.38, 0.46, paint);
+      for (let k = 0; k < 5; k++) box(0.06, 0.25, 0.05, metal, -0.2 + k * 0.1, 0.55, 1.55);   // griglia
+      add(new THREE.TorusGeometry(0.32, 0.07, 6, 14).rotateX(Math.PI / 2), metal, 0, 0.4, -1.5);
+      cyl(0.28, 0.28, 0.2, rubber, 0, 0.95, -1.45, body, 14).rotation.x = Math.PI / 2;   // ruota di scorta
+      tube([0.4, 1.0, -1.0], [0.55, 2.0, -1.2], 0.02, metal);
+      add(new THREE.SphereGeometry(0.08, 8, 6), tail, 0.55, 2.02, -1.2);
+      wheel(0.98, 0.85, 0.36, 0.42, paint); wheel(-0.98, 0.85, 0.36, 0.42, paint); wheel(0.98, -0.85, 0.38, 0.46, paint); wheel(-0.98, -0.85, 0.38, 0.46, paint);
       seatY = 0.95; seatZ = -0.35;
       break;
     }
-    case 'ruspa': { // fuoristrada alto con roll bar e ruote tassellate
-      box(1.8, 0.5, 2.8, paint, 0, 1.0, 0);
-      box(2.1, 0.25, 0.4, metal, 0, 0.9, 1.6);                                  // paraurti
-      for (const sx of [-0.55, 0, 0.55]) box(0.1, 0.5, 0.1, metal, sx, 1.2, 1.65);
+    case 'ruspa': { // fuoristrada: cassone, parafanghi, roll bar con fari, ammortizzatori
+      side([[-1.6, 0.95], [1.55, 0.95], [1.75, 1.25], [1.55, 1.55], [0.55, 1.6], [0.45, 1.3], [-1.0, 1.3], [-1.1, 1.62], [-1.6, 1.62]], 1.7, paint);
       for (const sx of [1, -1]) {
-        box(0.12, 1.3, 0.12, metal, sx * 0.75, 1.85, -0.9);                       // roll bar
-        add(new THREE.SphereGeometry(0.18, 8, 6), light, sx * 0.55, 1.35, 1.42);
+        for (const z of [1.05, -1.05]) add(new THREE.CylinderGeometry(0.72, 0.72, 0.62, 16, 1, true, -Math.PI / 2, Math.PI).rotateZ(Math.PI / 2), accent, sx * 1.15, 0.65, z).material.side = THREE.DoubleSide;
+        tube([sx * 0.75, 1.3, -0.95], [sx * 0.7, 2.45, -0.75], 0.07, metal);
+        tube([sx * 0.7, 2.45, -0.75], [sx * 0.7, 2.4, 0.15], 0.07, metal);
+        tube([sx * 0.7, 2.4, 0.15], [sx * 0.75, 1.55, 0.5], 0.07, metal);
+        for (const z of [1.05, -1.05]) { tube([sx * 0.8, 1.0, z], [sx * 1.0, 0.6, z], 0.06, mat('#ffd23f')); cyl(0.09, 0.09, 0.35, metal, sx * 0.9, 0.85, z); }
+        cyl(0.08, 0.1, 0.9, metal, sx * 0.6, 1.95, -1.4);                            // scarichi verticali
+        box(0.25, 0.14, 0.06, head, sx * 0.55, 1.35, 1.66);
+        box(0.2, 0.12, 0.06, tail, sx * 0.6, 1.4, -1.66);
       }
-      box(1.62, 0.12, 0.12, metal, 0, 2.5, -0.9);
-      box(1.0, 0.25, 0.6, dark, 0, 1.35, 1.0);                                  // presa d'aria
-      wheel(1.15, 1.05, 0.6, 0.6, metal, true); wheel(-1.15, 1.05, 0.6, 0.6, metal, true); wheel(1.15, -1.05, 0.6, 0.6, metal, true); wheel(-1.15, -1.05, 0.6, 0.6, metal, true);
+      tube([-0.7, 2.43, -0.3], [0.7, 2.43, -0.3], 0.07, metal);
+      for (let k = 0; k < 4; k++) add(new THREE.CylinderGeometry(0.11, 0.11, 0.1, 10).rotateX(Math.PI / 2), head, -0.45 + k * 0.3, 2.55, -0.25);
+      tube([-1.0, 1.0, 1.85], [1.0, 1.0, 1.85], 0.08, metal);                       // paraurti tubolare
+      for (const sx of [-0.6, 0, 0.6]) tube([sx, 0.95, 1.85], [sx, 1.45, 1.65], 0.05, metal);
+      box(1.0, 0.18, 0.8, dark, 0, 1.62, 1.0);
+      box(1.72, 0.03, 0.5, white, 0, 1.58, 1.0);
+      wheel(1.18, 1.05, 0.6, 0.6, metal, true); wheel(-1.18, 1.05, 0.6, 0.6, metal, true); wheel(1.18, -1.05, 0.6, 0.6, metal, true); wheel(-1.18, -1.05, 0.6, 0.6, metal, true);
       seatY = 1.35; seatZ = -0.35;
       break;
     }
-    case 'razzo': { // fusoliera a siluro con due turbine luminose e pinne
-      add(new THREE.CylinderGeometry(0.62, 0.7, 3.0, 14).rotateX(Math.PI / 2), paint, 0, 0.7, 0);
-      add(new THREE.ConeGeometry(0.62, 1.2, 14).rotateX(Math.PI / 2), mat('#ffffff'), 0, 0.7, 2.1);
+    case 'razzo': { // fusoliera tornita, due turbine con prese d'aria, pinne e anelli decorativi
+      lathe([[0, 2.45], [0.18, 2.3], [0.42, 1.9], [0.6, 1.2], [0.68, 0.3], [0.66, -0.8], [0.55, -1.4], [0.35, -1.6], [0, -1.6]], paint, 0, 0.72, 0, 22);
+      for (const z of [1.3, -0.9]) add(new THREE.TorusGeometry(0.66, 0.05, 6, 22), white, 0, 0.72, z);
       for (const sx of [1, -1]) {
-        add(new THREE.CylinderGeometry(0.32, 0.38, 1.4, 12).rotateX(Math.PI / 2), metal, sx * 0.85, 0.75, -1.0);
-        add(new THREE.CircleGeometry(0.28, 12).rotateY(Math.PI), mat('#ff8a00', '#ff5a00'), sx * 0.85, 0.75, -1.71);
-        const fin = box(0.08, 0.7, 0.8, paint, sx * 0.4, 1.25, -1.35); fin.rotation.z = sx * 0.35;
+        lathe([[0, 0.8], [0.3, 0.75], [0.4, 0.4], [0.42, -0.5], [0.34, -0.8], [0.3, -0.8]], metal, sx * 0.88, 0.78, -0.95, 16);
+        add(new THREE.TorusGeometry(0.33, 0.06, 6, 16), accent, sx * 0.88, 0.78, -0.18);
+        add(new THREE.CircleGeometry(0.28, 14).rotateY(Math.PI), mat('#ff8a00', '#ff6a00'), sx * 0.88, 0.78, -1.76);
+        add(new THREE.ConeGeometry(0.22, 0.6, 12).rotateX(-Math.PI / 2), mat('#ffd23f', '#ffb000'), sx * 0.88, 0.78, -2.05).userData.keep = true;
+        tube([sx * 0.4, 0.8, -0.6], [sx * 0.7, 0.8, -0.7], 0.06, metal);
+        const fin = side([[-0.6, 0], [0.4, 0], [-0.3, 0.7], [-0.6, 0.7]], 0.06, paint, 0, 0.02); fin.position.set(sx * 0.5, 1.15, -1.0); fin.rotation.z = sx * 0.5;
+        const can = side([[-0.25, 0], [0.25, 0], [-0.1, 0.25]], 0.04, accent, 0, 0.01); can.position.set(sx * 0.6, 0.75, 1.5); can.rotation.z = sx * 1.3;
       }
-      box(0.08, 0.8, 0.9, paint, 0, 1.35, -1.3);
-      wheel(0.85, 1.05, 0.34, 0.3); wheel(-0.85, 1.05, 0.34, 0.3); wheel(0.95, -0.6, 0.4, 0.36); wheel(-0.95, -0.6, 0.4, 0.36);
-      seatY = 1.0; seatZ = -0.2;
+      side([[-0.7, 0], [0.3, 0], [-0.4, 0.8], [-0.7, 0.85]], 0.07, paint, 0, 0.02).position.set(0, 1.3, -1.0);
+      add(new THREE.SphereGeometry(0.1, 8, 6), head, 0, 0.72, 2.5);
+      wheel(0.82, 1.15, 0.34, 0.3); wheel(-0.82, 1.15, 0.34, 0.3); wheel(0.98, -0.55, 0.4, 0.36); wheel(-0.98, -0.55, 0.4, 0.36);
+      for (const sx of [1, -1]) { tube([sx * 0.4, 0.5, 1.15], [sx * 0.82, 0.34, 1.15], 0.04, metal); tube([sx * 0.5, 0.45, -0.55], [sx * 0.98, 0.4, -0.55], 0.04, metal); }
+      seatY = 1.05; seatZ = -0.15;
       break;
     }
-    case 'zucca': { // carrozzeria a spicchi come una zucca, con faccia luminosa sul muso
-      const pumpkinM = mat('#e8761c', '#3a1800');
-      for (let k = 0; k < 6; k++) { const seg = add(new THREE.SphereGeometry(0.75, 12, 10), pumpkinM, Math.sin(k * 1.047) * 0.45, 0.8, Math.cos(k * 1.047) * 0.45 + 0.2); seg.scale.set(0.8, 0.8, 1.3); }
-      box(1.6, 0.25, 2.4, paint, 0, 0.45, -0.1);                                // pianale nel colore del giocatore
-      for (const sx of [1, -1]) add(new THREE.ConeGeometry(0.14, 0.22, 3).rotateX(Math.PI / 2), mat('#ffd23f', '#ffb000'), sx * 0.3, 0.95, 1.38);
-      box(0.6, 0.1, 0.06, mat('#ffd23f', '#ffb000'), 0, 0.68, 1.38);
-      add(new THREE.CylinderGeometry(0.06, 0.08, 0.7, 6), mat('#3b5a1e'), 0.3, 1.75, -1.0).rotation.z = 0.3; // gambo-antenna
-      wheel(0.95, 0.95, 0.38, 0.38, mat('#5b2a86')); wheel(-0.95, 0.95, 0.38, 0.38, mat('#5b2a86')); wheel(1.0, -0.95, 0.42, 0.44, mat('#5b2a86')); wheel(-1.0, -0.95, 0.42, 0.44, mat('#5b2a86'));
-      seatY = 1.05; seatZ = -0.45;
+    case 'zucca': { // zucca a spicchi intagliata con faccia luminosa, gambo e foglia
+      const pg = new THREE.SphereGeometry(1, 32, 20), pp = pg.attributes.position;
+      for (let v = 0; v < pp.count; v++) {
+        const x = pp.getX(v), y = pp.getY(v), z = pp.getZ(v), k = 1 + 0.07 * Math.cos(10 * Math.atan2(x, z)) * Math.sqrt(1 - y * y);
+        pp.setXYZ(v, x * k, y, z * k);
+      }
+      pg.computeVertexNormals();
+      const pumpkinM = new THREE.MeshPhongMaterial({ color: '#e8761c', emissive: '#2a1000', shininess: 40 });
+      const pk = add(pg, pumpkinM, 0, 0.9, 0.15); pk.scale.set(0.95, 0.62, 1.3);
+      box(1.2, 0.55, 0.95, dark, 0, 1.2, -0.4);                                      // abitacolo intagliato
+      const faceM = mat('#ffd23f', '#ffb000');
+      for (const sx of [1, -1]) add(new THREE.ConeGeometry(0.17, 0.26, 3).rotateX(Math.PI / 2).rotateZ(Math.PI), faceM, sx * 0.32, 1.05, 1.42);
+      side([[-0.42, 0], [-0.3, -0.1], [-0.15, 0], [0, -0.12], [0.15, 0], [0.3, -0.1], [0.42, 0], [0.3, 0.12], [-0.3, 0.12]], 0.05, faceM, 0, 0.01).position.set(0, 0.78, 1.4);
+      body.children[body.children.length - 1].rotation.y = Math.PI / 2;
+      const stem = cyl(0.07, 0.11, 0.6, mat('#3b5a1e'), 0.15, 1.65, -0.9); stem.rotation.z = 0.35;
+      const leaf = side([[0, 0], [0.25, 0.12], [0.5, 0], [0.25, -0.12]], 0.02, mat('#4f8a3c'), 0, 0.01); leaf.position.set(0.35, 1.85, -0.9); leaf.rotation.z = -0.4;
+      side([[-1.4, 0.25], [1.5, 0.25], [1.6, 0.42], [-1.4, 0.42]], 1.6, paint);       // pianale nel colore del giocatore
+      for (const sx of [1, -1]) {
+        add(new THREE.TorusGeometry(0.5, 0.06, 6, 16, Math.PI).rotateY(Math.PI / 2), mat('#2f5a1e'), sx * 1.0, 0.45, 0.95);
+        box(0.18, 0.1, 0.05, tail, sx * 0.45, 0.6, -1.45);
+      }
+      wheel(0.98, 0.95, 0.38, 0.38, mat('#5b2a86')); wheel(-0.98, 0.95, 0.38, 0.38, mat('#5b2a86')); wheel(1.02, -0.95, 0.42, 0.44, mat('#5b2a86')); wheel(-1.02, -0.95, 0.42, 0.44, mat('#5b2a86'));
+      seatY = 1.08; seatZ = -0.45;
       break;
     }
-    default: { // classico: telaio aperto, pance laterali, scarichi
-      box(1.6, 0.35, 2.6, paint, 0, 0.45, 0);
-      box(1.2, 0.3, 0.9, paint, 0, 0.55, 1.35);
-      box(1.9, 0.15, 0.35, dark, 0, 0.6, 1.8);
+    default: { // classico: telaio tubolare, muso sagomato, pance, motore e alettone
+      side([[-1.45, 0.25], [1.55, 0.25], [1.75, 0.38], [1.5, 0.48], [-1.45, 0.48]], 1.5, dark);
+      side([[0.9, 0.35], [1.95, 0.35], [2.1, 0.48], [1.85, 0.72], [0.9, 0.82]], 1.15, paint);
       for (const sx of [1, -1]) {
-        box(0.35, 0.4, 1.2, paint, sx * 0.95, 0.55, -0.1);
-        add(new THREE.CylinderGeometry(0.09, 0.11, 0.6, 8).rotateX(Math.PI / 2 - 0.3), metal, sx * 0.4, 0.75, -1.5);
-        box(0.1, 0.5, 0.3, dark, sx * 0.6, 0.85, -1.2);
+        side([[-0.95, 0.3], [0.7, 0.3], [0.92, 0.52], [0.6, 0.76], [-0.95, 0.76]], 0.42, paint, sx * 0.95);
+        box(0.44, 0.03, 1.3, white, sx * 0.95, 0.8, -0.1);                          // striscia sulla pancia
+        tube([sx * 0.55, 0.45, 2.0], [sx * 1.2, 0.45, 1.7], 0.05, metal);
+        tube([sx * 0.4, 0.75, -1.25], [sx * 0.62, 0.95, -1.7], 0.07, metal);       // scarichi
+        cyl(0.09, 0.09, 0.08, dark, sx * 0.62, 0.97, -1.72).rotation.x = 1.0;
+        box(0.08, 0.55, 0.3, accent, sx * 0.85, 1.05, -1.25);
+        tube([sx * 0.8, 0.5, 1.0], [sx * 0.95, 0.42, 1.0], 0.04, metal);
       }
-      box(1.7, 0.12, 0.4, paint, 0, 1.15, -1.2);
-      wheel(0.95, 1.0, 0.42, 0.4); wheel(-0.95, 1.0, 0.42, 0.4); wheel(1.0, -0.95, 0.42, 0.4); wheel(-1.0, -0.95, 0.42, 0.4);
+      tube([-1.1, 0.45, 2.1], [1.1, 0.45, 2.1], 0.06, metal);
+      box(0.85, 0.45, 0.6, metal, 0, 0.72, -1.1);                                   // motore
+      cyl(0.18, 0.18, 0.3, dark, 0.25, 1.0, -1.1);
+      wing(1.9, 0.5, paint, 0, 1.32, -1.3, 0.18);
+      box(1.15, 0.03, 0.5, white, 0, 0.84, 1.45);
+      lights(2.05, 0.6, 0.35, -1.5, 0.55, 0.45);
+      wheel(0.95, 1.0, 0.42, 0.42); wheel(-0.95, 1.0, 0.42, 0.42); wheel(1.0, -0.95, 0.44, 0.48); wheel(-1.0, -0.95, 0.44, 0.48);
     }
   }
 
-  // Pilota (uguale per tutti i kart, cambia solo l'altezza del sedile)
+  // Pilota: sedile con poggiatesta, busto, braccia e guanti sul volante
   const dy = seatY - 0.85, dz = seatZ + 0.5;
-  box(0.9, 0.5, 0.7, dark, 0, 0.85 + dy, -0.5 + dz);                             // sedile
-  const helmet = add(new THREE.SphereGeometry(0.45, 12, 10), null, 0, 1.55 + dy, -0.3 + dz);
-  box(0.6, 0.18, 0.1, mat('#1b1446'), 0, 1.58 + dy, 0.1 + dz);                  // visiera
-  box(0.7, 0.6, 0.5, paint, 0, 1.05 + dy, -0.25 + dz);                           // busto
-  add(new THREE.TorusGeometry(0.25, 0.05, 6, 12), dark, 0, 1.1 + dy, 0.45 + dz).rotation.x = -0.6; // volante
+  const ch = charOf(charId), helmetM = new THREE.MeshPhongMaterial({ color: ch.helmet, shininess: 100 });
+  box(0.9, 0.12, 0.7, dark, 0, 0.66 + dy, -0.45 + dz);
+  box(0.9, 0.8, 0.12, dark, 0, 1.05 + dy, -0.85 + dz);
+  box(0.5, 0.3, 0.1, dark, 0, 1.6 + dy, -0.85 + dz);
+  box(0.7, 0.6, 0.5, paint, 0, 1.05 + dy, -0.3 + dz);                              // busto
+  box(0.72, 0.1, 0.52, white, 0, 1.2 + dy, -0.3 + dz);
+  const hy = 1.6 + dy, hz = -0.3 + dz;
+  add(new THREE.SphereGeometry(0.45, 16, 12), helmetM, 0, hy, hz);
+  const visor = add(new THREE.SphereGeometry(0.42, 14, 8, -0.9, 1.8, 1.1, 0.6), mat('#1b1446', '#0a0830'), 0, hy, hz + 0.06);
+  visor.scale.set(1.04, 1, 1.06);
+  add(new THREE.TorusGeometry(0.45, 0.04, 6, 18).rotateY(Math.PI / 2), white, 0, hy, hz);  // riga sul casco
+  const wheelZ = 0.45 + dz, wheelY = 1.12 + dy;
+  add(new THREE.TorusGeometry(0.24, 0.045, 6, 16), dark, 0, wheelY, wheelZ).rotation.x = -0.6;
+  box(0.36, 0.04, 0.04, metal, 0, wheelY, wheelZ).rotation.x = -0.6;
+  tube([0, wheelY - 0.1, wheelZ + 0.05], [0, 0.55 + dy * 0.5, wheelZ + 0.6], 0.03, metal);
+  for (const sx of [1, -1]) {
+    tube([sx * 0.33, 1.25 + dy, -0.25 + dz], [sx * 0.24, wheelY + 0.05, wheelZ - 0.05], 0.09, paint);
+    add(new THREE.SphereGeometry(0.1, 8, 6), white, sx * 0.22, wheelY + 0.04, wheelZ);
+    if (kart.id !== 'razzo') { const mir = box(0.18, 0.12, 0.04, metal, sx * 0.62, 1.3 + dy, 0.35 + dz); tube([sx * 0.45, 1.05 + dy, 0.3 + dz], [sx * 0.58, 1.28 + dy, 0.35 + dz], 0.02, dark); }
+  }
+  // Orecchie, becco o corno del personaggio sul casco
+  if (ch.extra === 'ears') for (const s of [1, -1]) add(new THREE.CapsuleGeometry(0.1, 0.6, 4, 8), helmetM, s * 0.18, hy + 0.65, hz).rotation.z = -s * 0.15;
+  if (ch.extra === 'pointy' || ch.extra === 'cat') for (const s of [1, -1]) add(new THREE.ConeGeometry(0.16, ch.extra === 'cat' ? 0.3 : 0.4, 4), helmetM, s * 0.26, hy + 0.45, hz);
+  if (ch.extra === 'round') for (const s of [1, -1]) add(new THREE.SphereGeometry(0.14, 8, 6), helmetM, s * 0.32, hy + 0.35, hz);
+  if (ch.extra === 'beak') add(new THREE.ConeGeometry(0.12, 0.3, 6), mat('#f2994a'), 0, hy - 0.08, hz + 0.5).rotation.x = Math.PI / 2;
+  if (ch.extra === 'horn') add(new THREE.ConeGeometry(0.1, 0.45, 6), mat('#f5f0e1'), 0, hy + 0.15, hz + 0.45).rotation.x = 0.9;
+
+  bakeGroup(body);
   g.add(body);
 
   // Scintille del drift dietro le ruote posteriori
@@ -269,15 +415,6 @@ function makeKart(color, charId, kartId) {
     g.add(m);
     return m;
   });
-  // Casco del personaggio con orecchie, becco o corno
-  const ch = charOf(charId), helmetM = new THREE.MeshLambertMaterial({ color: ch.helmet });
-  helmet.material = helmetM;
-  const hx = 0, hy = 1.55 + dy, hz = -0.3 + dz;
-  if (ch.extra === 'ears') for (const s of [1, -1]) add(new THREE.CapsuleGeometry(0.1, 0.6, 4, 8), helmetM, s * 0.18, hy + 0.65, hz).rotation.z = -s * 0.15;
-  if (ch.extra === 'pointy' || ch.extra === 'cat') for (const s of [1, -1]) add(new THREE.ConeGeometry(0.16, ch.extra === 'cat' ? 0.3 : 0.4, 4), helmetM, s * 0.26, hy + 0.45, hz);
-  if (ch.extra === 'round') for (const s of [1, -1]) add(new THREE.SphereGeometry(0.14, 8, 6), helmetM, s * 0.32, hy + 0.35, hz);
-  if (ch.extra === 'beak') add(new THREE.ConeGeometry(0.12, 0.3, 6), mat('#f2994a'), hx, hy - 0.08, hz + 0.5).rotation.x = Math.PI / 2;
-  if (ch.extra === 'horn') add(new THREE.ConeGeometry(0.1, 0.45, 6), mat('#f5f0e1'), hx, hy + 0.15, hz + 0.45).rotation.x = 0.9;
   const w = statsOf(charId, kartId).weight;
   g.scale.setScalar(w > 1.3 ? 1.08 : w < 0.75 ? 0.94 : 1);
   // Bolla dello scudo
