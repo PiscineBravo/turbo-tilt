@@ -49,7 +49,7 @@ export class Net {
         if (this.players.length >= MAX_PLAYERS) return this._refuse(c, `La stanza è piena (${MAX_PLAYERS} giocatori)`);
         if (this.inRace) return this._refuse(c, 'Gara in corso, riprova tra poco');
         this.conns.set(c.peer, c);
-        this.players.push({ id: c.peer, name: String(d.name || 'Pilota').slice(0, 12), color: String(d.color), char: String(d.char || 'rocco') });
+        this.players.push({ id: c.peer, name: String(d.name || 'Pilota').slice(0, 12), color: String(d.color), char: String(d.char || 'rocco'), kart: String(d.kart || 'classico') });
         return this._lobby();
       }
       if (!this.conns.has(c.peer)) return;

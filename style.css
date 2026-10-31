@@ -132,11 +132,18 @@ button small { font-size: 12px; opacity: .8; }
 #scr-chars { justify-content: flex-end; padding-top: 60px; }
 .chars-layout { flex: 1; width: 100%; display: grid; grid-template-columns: minmax(200px, 1fr) minmax(120px, 1.1fr) minmax(190px, 0.9fr); gap: 10px; align-items: center; }
 .char-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; align-content: center; }
-.char-grid button { display: flex; flex-direction: column; align-items: center; padding: 8px 4px; border-radius: 14px; border: 3px solid transparent;
+.char-grid button { display: flex; flex-direction: column; align-items: center; padding: 4px 4px; border-radius: 14px; border: 3px solid transparent;
   background: rgba(255,255,255,.12); color: #fff; font: 800 14px system-ui, sans-serif; cursor: pointer; }
-.char-grid button span { font-size: 30px; }
+.char-grid button span { font-size: 24px; }
 .char-grid button small { font-size: 10px; opacity: .8; font-weight: 600; }
 .char-grid button.sel { border-color: #ffd23f; background: rgba(255,210,63,.25); }
+.char-col { display: flex; flex-direction: column; gap: 6px; }
+.kart-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 4px; }
+.kart-grid button { display: flex; flex-direction: column; align-items: center; padding: 3px 2px; border-radius: 10px; border: 2px solid transparent;
+  background: rgba(255,255,255,.1); color: #fff; font: 700 10px system-ui, sans-serif; cursor: pointer; }
+.kart-grid button span { font-size: 18px; }
+.kart-grid button.sel { border-color: #7fd6ff; background: rgba(127,214,255,.2); }
+.kart-desc { font-size: 11px; font-weight: 700; color: #7fd6ff; text-align: center; min-height: 14px; }
 .char-info { background: rgba(10,8,40,.55); border-radius: 16px; padding: 12px 14px; display: flex; flex-direction: column; gap: 7px; }
 .char-info h3 { font-size: 26px; font-style: italic; }
 .ci-class { font-weight: 700; color: #ffd23f; font-size: 13px; margin-top: -6px; }

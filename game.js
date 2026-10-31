@@ -26,7 +26,7 @@ const CHARS = [
 ];
 const charOf = id => CHARS.find(c => c.id === id) || CHARS[2];
 
-let settings = { char: 'rocco', name: 'Pilota', color: COLORS[0], invert: false, sens: 6, view: 0, track: 'prato', laps: 3, muted: false, bots: 5, level: 'medio' };
+let settings = { char: 'rocco', kart: 'classico', name: 'Pilota', color: COLORS[0], invert: false, sens: 6, view: 0, track: 'prato', laps: 3, muted: false, bots: 5, level: 'medio' };
 try { Object.assign(settings, JSON.parse(localStorage.getItem('tt-settings') || '{}')); } catch {}
 const saveSettings = () => { try { localStorage.setItem('tt-settings', JSON.stringify(settings)); } catch {} };
 
@@ -141,29 +141,127 @@ function rampAt(idx, dist) {
 const slopePitch = i => -Math.asin(clamp(tangents[i].y, -0.5, 0.5));
 
 // ---------- Kart ----------
-function makeKart(color, charId) {
+// ---------- Kart (modelli originali) ----------
+// Ogni modello cambia forma, ruote, altezza del sedile e un po' le statistiche del pilota
+const KARTS = [
+  { id: 'classico', name: 'Classico', icon: '🏁', desc: 'Equilibrato', acc: 1, top: 1, weight: 1 },
+  { id: 'freccia', name: 'Freccia', icon: '🏎️', desc: 'Velocissimo, parte lento', acc: 0.9, top: 1.06, weight: 0.95 },
+  { id: 'bolla', name: 'Bolla', icon: '🫧', desc: 'Scatto bruciante', acc: 1.14, top: 0.95, weight: 0.85 },
+  { id: 'ruspa', name: 'Ruspa', icon: '🚙', desc: 'Pesante, spinge tutti', acc: 0.93, top: 0.99, weight: 1.35 },
+  { id: 'razzo', name: 'Razzo', icon: '🚀', desc: 'Punta alta, poca ripresa', acc: 0.86, top: 1.08, weight: 1.05 },
+  { id: 'zucca', name: 'Zucchina', icon: '🎃', desc: 'Agile e simpatica', acc: 1.06, top: 0.98, weight: 0.95 },
+];
+const kartOf = id => KARTS.find(k => k.id === id) || KARTS[0];
+// Statistiche finali = pilota × kart
+const statsOf = (charId, kartId) => { const c = charOf(charId), k = kartOf(kartId); return { acc: c.acc * k.acc, top: c.top * k.top, weight: c.weight * k.weight }; };
+
+const _mats = new Map();
+const mat = (c, e) => { const key = c + (e || ''); if (!_mats.has(key)) _mats.set(key, new THREE.MeshLambertMaterial({ color: c, emissive: e || '#000000' })); return _mats.get(key); };
+
+function makeKart(color, charId, kartId) {
   const g = new THREE.Group(), body = new THREE.Group();
   g.rotation.order = 'YXZ';   // prima la direzione, poi l'inclinazione in salita/discesa
-  const paint = new THREE.MeshLambertMaterial({ color }), dark = new THREE.MeshLambertMaterial({ color: '#222' });
-  const add = (geo, mat, x, y, z, parent = body) => { const m = new THREE.Mesh(geo, mat); m.position.set(x, y, z); m.castShadow = true; parent.add(m); return m; };
-  add(new THREE.BoxGeometry(1.6, 0.35, 2.6), paint, 0, 0.45, 0);              // telaio
-  add(new THREE.BoxGeometry(1.2, 0.3, 0.9), paint, 0, 0.55, 1.35);             // muso
-  add(new THREE.BoxGeometry(1.9, 0.15, 0.35), dark, 0, 0.6, 1.8);              // paraurti
-  add(new THREE.BoxGeometry(1.7, 0.12, 0.4), paint, 0, 1.15, -1.2);            // alettone
-  add(new THREE.BoxGeometry(0.1, 0.5, 0.3), dark, 0.6, 0.85, -1.2);
-  add(new THREE.BoxGeometry(0.1, 0.5, 0.3), dark, -0.6, 0.85, -1.2);
-  add(new THREE.BoxGeometry(0.9, 0.5, 0.7), dark, 0, 0.85, -0.5);              // sedile
-  const helmet = add(new THREE.SphereGeometry(0.45, 12, 10), null, 0, 1.55, -0.3); // casco
-  add(new THREE.BoxGeometry(0.6, 0.18, 0.1), new THREE.MeshLambertMaterial({ color: '#1b1446' }), 0, 1.58, 0.1); // visiera
-  add(new THREE.BoxGeometry(0.7, 0.6, 0.5), paint, 0, 1.05, -0.25);            // busto
-  add(new THREE.TorusGeometry(0.25, 0.05, 6, 12), dark, 0, 1.1, 0.45).rotation.x = -0.6; // volante
-  g.add(body);
-  const wheelG = new THREE.CylinderGeometry(0.42, 0.42, 0.4, 12); wheelG.rotateZ(Math.PI / 2);
+  const paint = new THREE.MeshLambertMaterial({ color }), dark = mat('#222226'), metal = mat('#9aa0a8'), light = mat('#fff6c8', '#a08a30');
+  const add = (geo, m, x, y, z, parent = body) => { const o = new THREE.Mesh(geo, m); o.position.set(x, y, z); o.castShadow = true; parent.add(o); return o; };
+  const box = (w, h, d, m, x, y, z, p) => add(new THREE.BoxGeometry(w, h, d), m, x, y, z, p);
+  const kart = kartOf(kartId);
+
+  // Ruota: copertone + cerchio colorato; front = sterzanti
   g.wheels = [];
-  for (const [x, z] of [[0.95, 1.0], [-0.95, 1.0], [1.0, -0.95], [-1.0, -0.95]]) {
-    const w = add(wheelG, dark, x, 0.42, z, g);
-    g.wheels.push(w);
+  const wheel = (x, z, r, w, rim = metal, knobby = false) => {
+    const wg = new THREE.Group();
+    add(new THREE.CylinderGeometry(r, r, w, 14).rotateZ(Math.PI / 2), dark, 0, 0, 0, wg);
+    add(new THREE.CylinderGeometry(r * 0.55, r * 0.55, w + 0.04, 10).rotateZ(Math.PI / 2), rim, 0, 0, 0, wg);
+    if (knobby) for (let k = 0; k < 8; k++) { const t = add(new THREE.BoxGeometry(w + 0.06, 0.12, 0.18), dark, 0, Math.cos(k * 0.785) * r, Math.sin(k * 0.785) * r, wg); t.rotation.x = k * 0.785; }
+    wg.position.set(x, r, z); g.add(wg); g.wheels.push(wg);
+  };
+  let seatY = 0.85, seatZ = -0.5;
+
+  switch (kart.id) {
+    case 'freccia': { // monoposto basso e affilato con alettone grande
+      box(1.3, 0.3, 3.2, paint, 0, 0.42, 0.1);
+      const nose = add(new THREE.ConeGeometry(0.62, 1.4, 4).rotateX(Math.PI / 2).rotateZ(Math.PI / 4), paint, 0, 0.42, 2.3); nose.scale.set(1.1, 0.5, 1);
+      box(2.1, 0.08, 0.45, dark, 0, 0.28, 2.6);                                  // alettone anteriore
+      for (const sx of [1, -1]) { box(0.35, 0.35, 1.4, paint, sx * 0.85, 0.45, -0.2); box(0.08, 0.7, 0.2, dark, sx * 0.5, 1.0, -1.45); }
+      box(2.0, 0.1, 0.55, paint, 0, 1.38, -1.5);                                  // alettone posteriore
+      box(2.0, 0.06, 0.3, dark, 0, 1.47, -1.65);
+      wheel(0.95, 1.5, 0.36, 0.32); wheel(-0.95, 1.5, 0.36, 0.32); wheel(1.0, -1.05, 0.46, 0.55); wheel(-1.0, -1.05, 0.46, 0.55);
+      seatY = 0.62; seatZ = -0.45;
+      break;
+    }
+    case 'bolla': { // guscio tondo e paffuto con due fari a occhioni
+      const shell = add(new THREE.SphereGeometry(1.15, 18, 14), paint, 0, 0.75, 0.15); shell.scale.set(1, 0.55, 1.3);
+      box(1.3, 0.3, 0.9, dark, 0, 0.95, -0.35);                                  // abitacolo scavato
+      for (const sx of [1, -1]) {
+        add(new THREE.SphereGeometry(0.22, 10, 8), light, sx * 0.45, 0.9, 1.45);
+        add(new THREE.SphereGeometry(0.1, 8, 6), mat('#111'), sx * 0.45, 0.92, 1.62);
+      }
+      add(new THREE.TorusGeometry(0.35, 0.06, 6, 14).rotateX(Math.PI / 2), metal, 0, 0.45, -1.45); // paraurti a ciambella
+      wheel(0.95, 0.85, 0.36, 0.42, paint); wheel(-0.95, 0.85, 0.36, 0.42, paint); wheel(0.95, -0.85, 0.38, 0.46, paint); wheel(-0.95, -0.85, 0.38, 0.46, paint);
+      seatY = 0.95; seatZ = -0.35;
+      break;
+    }
+    case 'ruspa': { // fuoristrada alto con roll bar e ruote tassellate
+      box(1.8, 0.5, 2.8, paint, 0, 1.0, 0);
+      box(2.1, 0.25, 0.4, metal, 0, 0.9, 1.6);                                  // paraurti
+      for (const sx of [-0.55, 0, 0.55]) box(0.1, 0.5, 0.1, metal, sx, 1.2, 1.65);
+      for (const sx of [1, -1]) {
+        box(0.12, 1.3, 0.12, metal, sx * 0.75, 1.85, -0.9);                       // roll bar
+        add(new THREE.SphereGeometry(0.18, 8, 6), light, sx * 0.55, 1.35, 1.42);
+      }
+      box(1.62, 0.12, 0.12, metal, 0, 2.5, -0.9);
+      box(1.0, 0.25, 0.6, dark, 0, 1.35, 1.0);                                  // presa d'aria
+      wheel(1.15, 1.05, 0.6, 0.6, metal, true); wheel(-1.15, 1.05, 0.6, 0.6, metal, true); wheel(1.15, -1.05, 0.6, 0.6, metal, true); wheel(-1.15, -1.05, 0.6, 0.6, metal, true);
+      seatY = 1.35; seatZ = -0.35;
+      break;
+    }
+    case 'razzo': { // fusoliera a siluro con due turbine luminose e pinne
+      add(new THREE.CylinderGeometry(0.62, 0.7, 3.0, 14).rotateX(Math.PI / 2), paint, 0, 0.7, 0);
+      add(new THREE.ConeGeometry(0.62, 1.2, 14).rotateX(Math.PI / 2), mat('#ffffff'), 0, 0.7, 2.1);
+      for (const sx of [1, -1]) {
+        add(new THREE.CylinderGeometry(0.32, 0.38, 1.4, 12).rotateX(Math.PI / 2), metal, sx * 0.85, 0.75, -1.0);
+        add(new THREE.CircleGeometry(0.28, 12).rotateY(Math.PI), mat('#ff8a00', '#ff5a00'), sx * 0.85, 0.75, -1.71);
+        const fin = box(0.08, 0.7, 0.8, paint, sx * 0.4, 1.25, -1.35); fin.rotation.z = sx * 0.35;
+      }
+      box(0.08, 0.8, 0.9, paint, 0, 1.35, -1.3);
+      wheel(0.85, 1.05, 0.34, 0.3); wheel(-0.85, 1.05, 0.34, 0.3); wheel(0.95, -0.6, 0.4, 0.36); wheel(-0.95, -0.6, 0.4, 0.36);
+      seatY = 1.0; seatZ = -0.2;
+      break;
+    }
+    case 'zucca': { // carrozzeria a spicchi come una zucca, con faccia luminosa sul muso
+      const pumpkinM = mat('#e8761c', '#3a1800');
+      for (let k = 0; k < 6; k++) { const seg = add(new THREE.SphereGeometry(0.75, 12, 10), pumpkinM, Math.sin(k * 1.047) * 0.45, 0.8, Math.cos(k * 1.047) * 0.45 + 0.2); seg.scale.set(0.8, 0.8, 1.3); }
+      box(1.6, 0.25, 2.4, paint, 0, 0.45, -0.1);                                // pianale nel colore del giocatore
+      for (const sx of [1, -1]) add(new THREE.ConeGeometry(0.14, 0.22, 3).rotateX(Math.PI / 2), mat('#ffd23f', '#ffb000'), sx * 0.3, 0.95, 1.38);
+      box(0.6, 0.1, 0.06, mat('#ffd23f', '#ffb000'), 0, 0.68, 1.38);
+      add(new THREE.CylinderGeometry(0.06, 0.08, 0.7, 6), mat('#3b5a1e'), 0.3, 1.75, -1.0).rotation.z = 0.3; // gambo-antenna
+      wheel(0.95, 0.95, 0.38, 0.38, mat('#5b2a86')); wheel(-0.95, 0.95, 0.38, 0.38, mat('#5b2a86')); wheel(1.0, -0.95, 0.42, 0.44, mat('#5b2a86')); wheel(-1.0, -0.95, 0.42, 0.44, mat('#5b2a86'));
+      seatY = 1.05; seatZ = -0.45;
+      break;
+    }
+    default: { // classico: telaio aperto, pance laterali, scarichi
+      box(1.6, 0.35, 2.6, paint, 0, 0.45, 0);
+      box(1.2, 0.3, 0.9, paint, 0, 0.55, 1.35);
+      box(1.9, 0.15, 0.35, dark, 0, 0.6, 1.8);
+      for (const sx of [1, -1]) {
+        box(0.35, 0.4, 1.2, paint, sx * 0.95, 0.55, -0.1);
+        add(new THREE.CylinderGeometry(0.09, 0.11, 0.6, 8).rotateX(Math.PI / 2 - 0.3), metal, sx * 0.4, 0.75, -1.5);
+        box(0.1, 0.5, 0.3, dark, sx * 0.6, 0.85, -1.2);
+      }
+      box(1.7, 0.12, 0.4, paint, 0, 1.15, -1.2);
+      wheel(0.95, 1.0, 0.42, 0.4); wheel(-0.95, 1.0, 0.42, 0.4); wheel(1.0, -0.95, 0.42, 0.4); wheel(-1.0, -0.95, 0.42, 0.4);
+    }
   }
+
+  // Pilota (uguale per tutti i kart, cambia solo l'altezza del sedile)
+  const dy = seatY - 0.85, dz = seatZ + 0.5;
+  box(0.9, 0.5, 0.7, dark, 0, 0.85 + dy, -0.5 + dz);                             // sedile
+  const helmet = add(new THREE.SphereGeometry(0.45, 12, 10), null, 0, 1.55 + dy, -0.3 + dz);
+  box(0.6, 0.18, 0.1, mat('#1b1446'), 0, 1.58 + dy, 0.1 + dz);                  // visiera
+  box(0.7, 0.6, 0.5, paint, 0, 1.05 + dy, -0.25 + dz);                           // busto
+  add(new THREE.TorusGeometry(0.25, 0.05, 6, 12), dark, 0, 1.1 + dy, 0.45 + dz).rotation.x = -0.6; // volante
+  g.add(body);
+
   // Scintille del drift dietro le ruote posteriori
   g.sparks = [1, -1].map(s => {
     const m = new THREE.Mesh(new THREE.OctahedronGeometry(0.22), new THREE.MeshBasicMaterial({ color: '#ffffff' }));
@@ -174,16 +272,17 @@ function makeKart(color, charId) {
   // Casco del personaggio con orecchie, becco o corno
   const ch = charOf(charId), helmetM = new THREE.MeshLambertMaterial({ color: ch.helmet });
   helmet.material = helmetM;
-  const hx = 0, hy = 1.55, hz = -0.3;
+  const hx = 0, hy = 1.55 + dy, hz = -0.3 + dz;
   if (ch.extra === 'ears') for (const s of [1, -1]) add(new THREE.CapsuleGeometry(0.1, 0.6, 4, 8), helmetM, s * 0.18, hy + 0.65, hz).rotation.z = -s * 0.15;
   if (ch.extra === 'pointy' || ch.extra === 'cat') for (const s of [1, -1]) add(new THREE.ConeGeometry(0.16, ch.extra === 'cat' ? 0.3 : 0.4, 4), helmetM, s * 0.26, hy + 0.45, hz);
   if (ch.extra === 'round') for (const s of [1, -1]) add(new THREE.SphereGeometry(0.14, 8, 6), helmetM, s * 0.32, hy + 0.35, hz);
-  if (ch.extra === 'beak') add(new THREE.ConeGeometry(0.12, 0.3, 6), new THREE.MeshLambertMaterial({ color: '#f2994a' }), hx, hy - 0.08, hz + 0.5).rotation.x = Math.PI / 2;
-  if (ch.extra === 'horn') add(new THREE.ConeGeometry(0.1, 0.45, 6), new THREE.MeshLambertMaterial({ color: '#f5f0e1' }), hx, hy + 0.15, hz + 0.45).rotation.x = 0.9;
-  g.scale.setScalar(ch.weight > 1.2 ? 1.08 : ch.weight < 0.8 ? 0.94 : 1);
+  if (ch.extra === 'beak') add(new THREE.ConeGeometry(0.12, 0.3, 6), mat('#f2994a'), hx, hy - 0.08, hz + 0.5).rotation.x = Math.PI / 2;
+  if (ch.extra === 'horn') add(new THREE.ConeGeometry(0.1, 0.45, 6), mat('#f5f0e1'), hx, hy + 0.15, hz + 0.45).rotation.x = 0.9;
+  const w = statsOf(charId, kartId).weight;
+  g.scale.setScalar(w > 1.3 ? 1.08 : w < 0.75 ? 0.94 : 1);
   // Bolla dello scudo
-  g.shieldMesh = new THREE.Mesh(new THREE.SphereGeometry(2, 16, 12), new THREE.MeshBasicMaterial({ color: '#7fd6ff', transparent: true, opacity: 0.25, depthWrite: false }));
-  g.shieldMesh.position.y = 0.9; g.shieldMesh.visible = false;
+  g.shieldMesh = new THREE.Mesh(new THREE.SphereGeometry(2.2, 16, 12), new THREE.MeshBasicMaterial({ color: '#7fd6ff', transparent: true, opacity: 0.25, depthWrite: false }));
+  g.shieldMesh.position.y = 1; g.shieldMesh.visible = false;
   g.add(g.shieldMesh);
   g.body = body;
   return g;
@@ -262,10 +361,10 @@ function gridSlot(slot) {
 function spawnPlayer(slot = 0) {
   if (player) scene.remove(player.mesh);
   const { i, pos, heading } = gridSlot(slot);
-  const mesh = makeKart(settings.color, settings.char);
+  const mesh = makeKart(settings.color, settings.char, settings.kart);
   scene.add(mesh);
   player = {
-    id: mp ? net.myId : 'me', ...kartExtras(settings.char),
+    id: mp ? net.myId : 'me', ...kartExtras(settings.char, settings.kart),
     mesh, pos, heading,
     speed: 0, idx: i, lap: 0, half: false, steerVis: 0, drift: 0, driftT: 0, driftVis: 0, boost: 0,
     moveH: heading, y: pos.y, floor: pos.y, vy: 0, rampH: 0,
@@ -432,7 +531,7 @@ function makeLabel(text) {
   return s;
 }
 function addRemote(p, slot) {
-  const mesh = makeKart(safeColor(p.color), p.char);
+  const mesh = makeKart(safeColor(p.color), p.char, p.kart);
   mesh.add(makeLabel(p.name));
   const g = gridSlot(slot);
   mesh.position.copy(g.pos); mesh.rotation.y = g.heading;
@@ -474,14 +573,14 @@ const LEVELS = {
 };
 let bots = [];
 
-function makeBot(id, name, color, slot, level, charId = CHARS[slot % CHARS.length].id) {
+function makeBot(id, name, color, slot, level, charId = CHARS[slot % CHARS.length].id, kartId = KARTS[slot % KARTS.length].id) {
   const g = gridSlot(slot), L = LEVELS[level] || LEVELS.medio;
-  const mesh = makeKart(color, charId);
+  const mesh = makeKart(color, charId, kartId);
   mesh.add(makeLabel(name));
   mesh.position.copy(g.pos); mesh.rotation.y = g.heading;
   scene.add(mesh);
   return {
-    ...kartExtras(charId),
+    ...kartExtras(charId, kartId),
     id, name, mesh, L, pos: g.pos, heading: g.heading, moveH: g.heading, speed: 0, idx: g.i,
     lap: 0, half: false, y: g.pos.y, floor: g.pos.y, vy: 0, rampH: 0, boost: 0, done: false, has: true,
     lane: slot % 2 ? -3 : 3, laneT: 1 + Math.random() * 2, prevCurv: 0, netT: Math.random() / 15,
@@ -491,7 +590,7 @@ function makeBot(id, name, color, slot, level, charId = CHARS[slot % CHARS.lengt
 function clearBots() { for (const b of bots) scene.remove(b.mesh); bots = []; }
 // Lista dei bot della gara: in gara singola dalle impostazioni, in stanza scelti dall'host
 function botEntries(count) {
-  return Array.from({ length: count }, (_, k) => ({ id: `bot-${k}`, name: `🤖 ${BOT_NAMES[k % BOT_NAMES.length]}`, color: BOT_COLORS[k % BOT_COLORS.length], char: CHARS[(k + 1) % CHARS.length].id, bot: true }));
+  return Array.from({ length: count }, (_, k) => ({ id: `bot-${k}`, name: `🤖 ${BOT_NAMES[k % BOT_NAMES.length]}`, color: BOT_COLORS[k % BOT_COLORS.length], char: CHARS[(k + 1) % CHARS.length].id, kart: KARTS[(k + 1) % KARTS.length].id, bot: true }));
 }
 
 const angleDiff = (a, b) => Math.atan2(Math.sin(a - b), Math.cos(a - b));
@@ -829,7 +928,7 @@ function updateItemHUD() {
 }
 
 // Stato comune a giocatore e bot
-const kartExtras = charId => ({ stats: charOf(charId), gems: 0, item: null, itemUses: 0, itemT: 0, roulette: 0, shield: 0, spin: 0, spinAng: 0, stall: 0, trick: false, trickT: 0, gasCD: null, padCD: 0 });
+const kartExtras = (charId, kartId) => ({ stats: statsOf(charId, kartId), gems: 0, item: null, itemUses: 0, itemT: 0, roulette: 0, shield: 0, spin: 0, spinAng: 0, stall: 0, trick: false, trickT: 0, gasCD: null, padCD: 0 });
 function updateKartTimers(k, dt) {
   k.shield = Math.max(0, k.shield - dt);
   k.stall = Math.max(0, k.stall - dt);
@@ -993,7 +1092,7 @@ let mp = false, raceSize = 1, results = [], lobbyPlayers = [], lobbyCfg = null;
 const raceCfg = () => ({ track: settings.track, laps: settings.laps, bots: settings.bots, level: settings.level });
 // In stanza i bot riempiono i posti liberi fino a 10
 const lobbyBots = () => Math.min(settings.bots, MAX_PLAYERS - lobbyPlayers.length);
-const me = () => ({ name: settings.name, color: settings.color, char: settings.char });
+const me = () => ({ name: settings.name, color: settings.color, char: settings.char, kart: settings.kart });
 
 function showLobby(room, msg = '') {
   state = 'lobby';
@@ -1040,7 +1139,7 @@ net.on('msg', m => {
       m.grid.forEach((p, i) => {
         if (p.id === net.myId) return;
         // I bot li guida il telefono dell'host; per gli altri sono avversari come gli altri
-        if (p.bot && net.isHost) bots.push(makeBot(p.id, p.name, safeColor(p.color), i, m.cfg?.level, p.char));
+        if (p.bot && net.isHost) bots.push(makeBot(p.id, p.name, safeColor(p.color), i, m.cfg?.level, p.char, p.kart));
         else addRemote(p, i);
       });
       startRace(Math.max(0, m.grid.findIndex(p => p.id === net.myId)));
@@ -1136,16 +1235,27 @@ function charPicker() {
     b.onclick = () => { settings.char = c.id; saveSettings(); charPicker(); refreshPreview(); sfx.click(); };
     el.appendChild(b);
   }
-  const c = charOf(settings.char);
+  const c = charOf(settings.char), k = kartOf(settings.kart), st = statsOf(settings.char, settings.kart);
   $('ci-name').textContent = `${c.icon} ${c.name}`;
-  $('ci-class').textContent = `Classe ${c.cls}`;
-  $('st-top').style.width = pct(c.top, 0.9, 1.08);
-  $('st-acc').style.width = pct(c.acc, 0.75, 1.25);
-  $('st-weight').style.width = pct(c.weight, 0.55, 1.5);
+  $('ci-class').textContent = `${c.cls} · ${k.icon} ${k.name}`;
+  $('st-top').style.width = pct(st.top, 0.85, 1.15);
+  $('st-acc').style.width = pct(st.acc, 0.7, 1.4);
+  $('st-weight').style.width = pct(st.weight, 0.55, 2.0);
+  // Scelta del kart
+  const kel = $('karts'); kel.innerHTML = '';
+  for (const kk of KARTS) {
+    const b = document.createElement('button');
+    b.innerHTML = `<span>${kk.icon}</span>${kk.name}`;
+    b.title = kk.desc;
+    b.classList.toggle('sel', kk.id === settings.kart);
+    b.onclick = () => { settings.kart = kk.id; saveSettings(); charPicker(); refreshPreview(); sfx.click(); };
+    kel.appendChild(b);
+  }
+  $('kart-desc').textContent = k.desc;
 }
 function refreshPreview() {
   if (previewKart) turntable.remove(previewKart);
-  previewKart = makeKart(settings.color, settings.char);
+  previewKart = makeKart(settings.color, settings.char, settings.kart);
   turntable.add(previewKart);
 }
 charPicker();
@@ -1178,7 +1288,7 @@ function startSolo() {
   mp = false; laps = settings.laps; loadTrack(cup ? cup.tracks[cup.i] : settings.track);
   clearBots(); results = [];
   const list = botEntries(settings.bots);
-  bots = list.map((e, k) => makeBot(e.id, e.name, e.color, k, settings.level, e.char));
+  bots = list.map((e, k) => makeBot(e.id, e.name, e.color, k, settings.level, e.char, e.kart));
   raceSize = list.length + 1;
   startRace(list.length);   // il giocatore parte in fondo alla griglia
 }
